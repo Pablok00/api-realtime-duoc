@@ -13,6 +13,8 @@ def inicio():
 def recibir_datos():
     data = request.get_json()
 
+    print("POST RECIBIDO EN /recibir-datos:", data, flush=True)
+
     registro = {
         "fecha_recepcion": datetime.now().isoformat(),
         "data": data
@@ -24,6 +26,25 @@ def recibir_datos():
     return jsonify({
         "mensaje": "Datos recibidos correctamente",
         "data": data
+    }), 200
+
+@app.route("/ver-datos", methods=["GET"])
+def ver_datos():
+    datos = []
+
+    try:
+        with open("datos_realtime.jsonl", "r", encoding="utf-8") as archivo:
+            for linea in archivo:
+                datos.append(json.loads(linea))
+    except FileNotFoundError:
+        return jsonify({
+            "mensaje": "Aún no hay datos recibidos",
+            "datos": []
+        }), 200
+
+    return jsonify({
+        "total_registros": len(datos),
+        "datos": datos
     }), 200
 
 if __name__ == "__main__":
