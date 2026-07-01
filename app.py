@@ -25,37 +25,95 @@ COLUMNAS_CSV = [
     "observaciones"
 ]
 
+# Campos que permiten reconocer que un diccionario corresponde
+# a un evento/venta válido para el proceso.
+CAMPOS_REFERENCIA_EVENTO = {
+    "cantidad",
+    "cliente",
+    "fecreg",
+    "forma_pago",
+    "genero",
+    "id_cliente",
+    "id_producto",
+    "monto",
+    "precio",
+    "producto"
+}
+
 
 @app.route("/", methods=["GET"])
 def inicio():
-    return "API funcionando correctamente"
+    return "API funcionando correctamente", 200
 
 
 @app.route("/recibir-datos", methods=["POST"])
 def recibir_datos():
-    data = request.get_json(silent=True)
+    # Lee el cuerpo tal como llegó, sin depender de Thunder Client
+    # ni del Content-Type configurado.
+    cuerpo = request.get_data(as_text=True)
 
-    if data is None:
+    if not cuerpo or not cuerpo.strip():
         return jsonify({
-            "mensaje": "No se recibió JSON válido"
+            "estado": "rechazado",
+            "error": "Cuerpo vacío",
+            "detalle": "La solicitud no contiene datos para procesar."
         }), 400
 
+    # Valida que el contenido sea JSON real.
+    try:
+        payload = json.loads(cuerpo)
+    except json.JSONDecodeError:
+        return jsonify({
+            "estado": "rechazado",
+            "error": "JSON inválido",
+            "detalle": "El cuerpo enviado no tiene una estructura JSON válida."
+        }), 400
+
+    # Acepta tres formatos:
+    # 1. Lista de eventos: [{...}, {...}]
+    # 2. Objeto con data: {"data": [{...}]}
+    # 3. Un único evento: {...}
+    eventos, error_estructura = extraer_eventos_entrada(payload)
+
+    if error_estructura:
+        return jsonify({
+            "estado": "rechazado",
+            "error": "Estructura inválida",
+            "detalle": error_estructura
+        }), 400
+
+    fecha_recepcion = datetime.now().astimezone().isoformat()
+
+    # Se almacena siempre una lista de eventos, aunque llegue uno solo.
     registro = {
-        "fecha_recepcion": datetime.now().isoformat(),
-        "data": data
+        "fecha_recepcion": fecha_recepcion,
+        "data": eventos
     }
 
-    print("POST RECIBIDO:", registro, flush=True)
-    print("GUARDANDO EN:", DATA_FILE, flush=True)
+    print(
+        f"POST recibido: {len(eventos)} evento(s) - {fecha_recepcion}",
+        flush=True
+    )
 
-    with open(DATA_FILE, "a", encoding="utf-8") as archivo:
-        archivo.write(json.dumps(registro, ensure_ascii=False) + "\n")
+    try:
+        with open(DATA_FILE, "a", encoding="utf-8") as archivo:
+            archivo.write(
+                json.dumps(registro, ensure_ascii=False) + "\n"
+            )
+    except OSError as error:
+        print("Error al guardar:", error, flush=True)
+
+        return jsonify({
+            "estado": "error",
+            "error": "No fue posible guardar los datos."
+        }), 500
 
     return jsonify({
+        "estado": "recibido",
         "mensaje": "Datos recibidos correctamente",
-        "archivo": DATA_FILE,
-        "total_registros_crudos": contar_registros_crudos(),
-        "data": data
+        "fecha_recepcion": fecha_recepcion,
+        "registros_recibidos": len(eventos),
+        "lotes_crudos_acumulados": contar_registros_crudos()
     }), 200
 
 
@@ -65,7 +123,7 @@ def ver_datos():
 
     return jsonify({
         "mensaje": "Datos encontrados" if datos else "Aún no hay datos recibidos",
-        "archivo": DATA_FILE,
+        "archivo_origen": os.path.basename(DATA_FILE),
         "total_registros_crudos": len(datos),
         "datos": datos
     }), 200
@@ -88,6 +146,7 @@ def descargar_csv():
 
     salida = StringIO()
     writer = csv.DictWriter(salida, fieldnames=COLUMNAS_CSV)
+
     writer.writeheader()
     writer.writerows(filas)
 
@@ -97,7 +156,9 @@ def descargar_csv():
         csv_texto,
         mimetype="text/csv; charset=utf-8",
         headers={
-            "Content-Disposition": "attachment; filename=datos_realtime_limpios.csv"
+            "Content-Disposition": (
+                "attachment; filename=datos_realtime_limpios.csv"
+            )
         }
     )
 
@@ -106,8 +167,17 @@ def descargar_csv():
 def resumen():
     filas = obtener_datos_limpios()
 
-    total_monto = sum(fila["monto"] for fila in filas if isinstance(fila["monto"], (int, float)))
-    total_cantidad = sum(fila["cantidad"] for fila in filas if isinstance(fila["cantidad"], int))
+    total_monto = sum(
+        fila["monto"]
+        for fila in filas
+        if isinstance(fila["monto"], (int, float))
+    )
+
+    total_cantidad = sum(
+        fila["cantidad"]
+        for fila in filas
+        if isinstance(fila["cantidad"], int)
+    )
 
     productos = {}
     formas_pago = {}
@@ -125,16 +195,74 @@ def resumen():
         "total_monto": round(total_monto, 2),
         "productos": productos,
         "formas_pago": formas_pago
-    })
+    }), 200
 
 
-@app.route("/debug", methods=["GET"])
-def debug():
-    return jsonify({
-        "cwd": os.getcwd(),
-        "archivo": DATA_FILE,
-        "existe_archivo": os.path.exists(DATA_FILE)
-    })
+def extraer_eventos_entrada(payload):
+    """
+    Convierte el payload recibido en una lista de eventos.
+    Retorna: (eventos, mensaje_error)
+    """
+
+    if isinstance(payload, list):
+        eventos = payload
+
+    elif isinstance(payload, dict):
+        # Caso: {"data": [{...}, {...}]}
+        if "data" in payload:
+            contenido = payload["data"]
+
+            if isinstance(contenido, list):
+                eventos = contenido
+
+            elif isinstance(contenido, dict):
+                eventos = [contenido]
+
+            else:
+                return None, (
+                    "La clave 'data' debe contener un objeto o una lista de registros."
+                )
+
+        # Caso: un único evento directo: {"cliente": "...", ...}
+        elif es_evento_estructura_valida(payload):
+            eventos = [payload]
+
+        else:
+            return None, (
+                "Se esperaba una lista de eventos, un objeto con la clave "
+                "'data' o un evento con campos como cliente, producto o monto."
+            )
+
+    else:
+        return None, (
+            "El JSON debe ser una lista o un objeto."
+        )
+
+    if not eventos:
+        return None, "No se recibieron eventos para procesar."
+
+    for indice, evento in enumerate(eventos, start=1):
+        if not isinstance(evento, dict):
+            return None, (
+                f"El registro {indice} no tiene formato de objeto JSON."
+            )
+
+        if not es_evento_estructura_valida(evento):
+            return None, (
+                f"El registro {indice} no contiene campos propios de una venta o evento."
+            )
+
+    return eventos, None
+
+
+def es_evento_estructura_valida(item):
+    if not isinstance(item, dict):
+        return False
+
+    return any(
+        campo in item
+        for campo in CAMPOS_REFERENCIA_EVENTO
+    )
 
 
 def leer_registros_crudos():
@@ -143,22 +271,56 @@ def leer_registros_crudos():
 
     datos = []
 
-    with open(DATA_FILE, "r", encoding="utf-8") as archivo:
-        for linea in archivo:
-            linea = linea.strip()
-            if not linea:
-                continue
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as archivo:
+            for linea in archivo:
+                linea = linea.strip()
 
-            try:
-                datos.append(json.loads(linea))
-            except json.JSONDecodeError:
-                print("Línea inválida ignorada:", linea, flush=True)
+                if not linea:
+                    continue
+
+                try:
+                    datos.append(json.loads(linea))
+                except json.JSONDecodeError:
+                    print(
+                        "Línea inválida ignorada en datos_realtime.jsonl",
+                        flush=True
+                    )
+
+    except OSError as error:
+        print("Error al leer archivo:", error, flush=True)
 
     return datos
 
 
 def contar_registros_crudos():
     return len(leer_registros_crudos())
+
+
+def normalizar_items_almacenados(data):
+    """
+    Permite leer tanto los registros nuevos como registros antiguos
+    generados antes de esta mejora.
+    """
+
+    if isinstance(data, list):
+        return data
+
+    if isinstance(data, dict):
+        # Compatibilidad con datos que podrían haber llegado
+        # como {"data": [{...}]}
+        if "data" in data:
+            contenido = data.get("data")
+
+            if isinstance(contenido, list):
+                return contenido
+
+            if isinstance(contenido, dict):
+                return [contenido]
+
+        return [data]
+
+    return []
 
 
 def obtener_datos_limpios():
@@ -170,17 +332,12 @@ def obtener_datos_limpios():
         fecha_recepcion = registro.get("fecha_recepcion", "")
         data = registro.get("data", [])
 
-        # Duoc a veces manda una lista de ventas.
-        # La prueba manual de PowerShell manda solo un diccionario.
-        if isinstance(data, dict):
-            items = [data]
-        elif isinstance(data, list):
-            items = data
-        else:
-            continue
+        items = normalizar_items_almacenados(data)
 
         for item in items:
-            if not isinstance(item, dict):
+            # Ignora pruebas antiguas mal enviadas o estructuras
+            # que no correspondan a ventas reales.
+            if not es_evento_estructura_valida(item):
                 continue
 
             fila = transformar_item(item, fecha_recepcion)
@@ -193,7 +350,11 @@ def obtener_datos_limpios():
             duplicados.add(clave_duplicado)
             filas.append(fila)
 
-    filas.sort(key=lambda x: x["fecha_registro"] or x["fecha_recepcion_api"])
+    filas.sort(
+        key=lambda fila: (
+            fila["fecha_registro"] or fila["fecha_recepcion_api"]
+        )
+    )
 
     return filas
 
@@ -203,7 +364,7 @@ def transformar_item(item, fecha_recepcion):
     cantidad = convertir_int(item.get("cantidad"))
     monto = convertir_float(item.get("monto"))
 
-    # Enriquecimiento: si no viene monto, lo calculamos.
+    # Enriquecimiento: si no viene monto, se calcula.
     if monto is None and precio is not None and cantidad is not None:
         monto = round(precio * cantidad, 2)
 
@@ -255,7 +416,11 @@ def crear_clave_duplicado(fila):
         "forma_pago": fila["forma_pago"]
     }
 
-    return json.dumps(campos_clave, sort_keys=True, ensure_ascii=False)
+    return json.dumps(
+        campos_clave,
+        sort_keys=True,
+        ensure_ascii=False
+    )
 
 
 def limpiar_texto(valor):
@@ -273,13 +438,14 @@ def convertir_float(valor):
         texto = str(valor).strip()
         texto = texto.replace("$", "").replace(" ", "")
 
-        # Soporta formato 1.234,56 y también 1234.56
+        # Soporta 1.234,56 y 1234.56
         if "," in texto and "." in texto:
             texto = texto.replace(".", "").replace(",", ".")
         else:
             texto = texto.replace(",", ".")
 
         return float(texto)
+
     except ValueError:
         return None
 
@@ -289,7 +455,12 @@ def convertir_int(valor):
         return None
 
     try:
-        return int(float(str(valor).strip().replace(",", ".")))
+        return int(
+            float(
+                str(valor).strip().replace(",", ".")
+            )
+        )
+
     except ValueError:
         return None
 
